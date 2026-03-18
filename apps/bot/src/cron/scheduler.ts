@@ -346,9 +346,9 @@ export class CronScheduler {
 				data: { enabled: false },
 			});
 
-			await this.notifySlackChannel(
+			await this.notifyTelegramChat(
 				job,
-				`:no_entry: Cron job *${job.name}* has been auto-disabled after ${MAX_CONSECUTIVE_FAILURES} consecutive failures. Re-enable it from the dashboard once the issue is resolved.`,
+				`Cron job "${job.name}" has been auto-disabled after ${MAX_CONSECUTIVE_FAILURES} consecutive failures. Re-enable it from the dashboard once the issue is resolved.`,
 			);
 		}
 	}
@@ -453,30 +453,29 @@ export class CronScheduler {
 	private async notifyJobFailure(job: CronJobRecord, errorMessage: string): Promise<void> {
 		const shortError =
 			errorMessage.length > 200 ? `${errorMessage.slice(0, 200)}...` : errorMessage;
-		await this.notifySlackChannel(job, `:warning: Cron job *${job.name}* failed: ${shortError}`);
+		await this.notifyTelegramChat(job, `Cron job "${job.name}" failed: ${shortError}`);
 	}
 
-	private async notifySlackChannel(job: CronJobRecord, text: string): Promise<void> {
-		const channel = job.slackChannel;
-		if (!channel) return;
+	private async notifyTelegramChat(job: CronJobRecord, text: string): Promise<void> {
+		const chatId = job.slackChannel;
+		if (!chatId) return;
 
-		const token = this.resolveSlackToken(job);
+		const token = this.resolveTelegramToken(job);
 		if (!token) return;
 
 		try {
-			const response = await fetch("https://slack.com/api/chat.postMessage", {
+			const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
 				method: "POST",
 				headers: {
-					Authorization: `Bearer ${token}`,
 					"Content-Type": "application/json; charset=utf-8",
 				},
-				body: JSON.stringify({ channel, text }),
+				body: JSON.stringify({ chat_id: chatId, text }),
 			});
-			const data = (await response.json()) as { ok: boolean; error?: string };
+			const data = (await response.json()) as { ok: boolean; description?: string };
 			if (!data.ok) {
 				this.logger.warn(
-					{ cronJobId: job.id, error: data.error },
-					"Failed to post cron failure notification to Slack",
+					{ cronJobId: job.id, error: data.description },
+					"Failed to post cron failure notification to Telegram",
 				);
 			}
 		} catch (err) {
@@ -484,7 +483,7 @@ export class CronScheduler {
 		}
 	}
 
-	private resolveSlackToken(job: CronJobRecord): string | null {
+	private resolveTelegramToken(job: CronJobRecord): string | null {
 		if (this.config.slackToken) return this.config.slackToken;
 
 		if (!job.workspace.slackBotToken || !this.config.encryptionKey) return null;

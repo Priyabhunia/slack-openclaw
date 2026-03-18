@@ -30,7 +30,7 @@ export interface PromptContext {
 function triggerLabel(triggerType: TriggerType): string {
 	switch (triggerType) {
 		case "MENTION":
-			return "Channel mention";
+			return "Mention or reply";
 		case "DM":
 			return "Direct message";
 		case "CRON":
@@ -51,9 +51,9 @@ function triggerLabel(triggerType: TriggerType): string {
 }
 
 function buildSpecializedPrompt(name: string, prompt: string, preamble?: string): string {
-	const lines = [`You are OpenViktor, an AI coworker in the "${name}" Slack workspace.`];
+	const lines = [`You are OpenViktor, an AI coworker in the "${name}" workspace on Telegram.`];
 	if (preamble) lines.push(preamble);
-	lines.push("", prompt);
+	lines.push("", "## Safety", ...buildSafetyRules(), "", prompt);
 	return lines.join("\n");
 }
 
@@ -62,7 +62,7 @@ function resolveSpecializedPrompt(ctx: PromptContext): string | null {
 		return buildSpecializedPrompt(
 			ctx.workspaceName,
 			ctx.onboardingPrompt,
-			"This is your FIRST interaction with this workspace — make a great first impression.",
+			"This is your first interaction with this workspace. Make a strong first impression.",
 		);
 	}
 	if (ctx.channelIntroPrompt) {
@@ -90,24 +90,27 @@ export function buildSystemPrompt(ctx: PromptContext): string {
 
 function buildCronPrompt(ctx: PromptContext): string {
 	const lines = [
-		`You are OpenViktor, an AI coworker in the "${ctx.workspaceName}" Slack workspace.`,
+		`You are OpenViktor, an AI coworker in the "${ctx.workspaceName}" workspace on Telegram.`,
 		`You are executing a scheduled cron job: "${ctx.cronJobName ?? "Unknown"}".`,
 		"",
 	];
 
 	if (ctx.cronRunCount === 0) {
 		lines.push(
-			"IMPORTANT: This is the FIRST TIME this cron is running. Pay special attention to initial setup and baseline data collection.",
+			"This is the first time this cron is running. Pay extra attention to setup and baseline data collection.",
 			"",
 		);
 	}
 
 	lines.push(
 		"## Guidelines",
-		"- Execute the task described below thoroughly.",
+		"- Execute the task thoroughly.",
 		"- Use available tools to gather information and take action.",
-		"- Post results to the appropriate Slack channel using coworker_send_slack_message.",
+		"- Post results to the appropriate Telegram chat using coworker_send_telegram_message.",
 		"- Be concise and direct in any messages you send.",
+		"",
+		"## Safety",
+		...buildSafetyRules(),
 		...buildErrorRules(),
 	);
 
@@ -123,55 +126,44 @@ function buildCronPrompt(ctx: PromptContext): string {
 
 function buildInteractivePrompt(ctx: PromptContext): string {
 	const lines = [
-		`You are OpenViktor, an AI coworker in the "${ctx.workspaceName}" Slack workspace.`,
-		"You are helpful, knowledgeable, and concise. You communicate like a capable team member — clear, direct, and friendly.",
+		`You are OpenViktor, an AI coworker in the "${ctx.workspaceName}" workspace on Telegram.`,
+		"You are helpful, knowledgeable, and concise. You communicate like a capable team member: clear, direct, and friendly.",
 		"",
 		"## Startup",
-		"- **Always call `read_learnings` as your first action** to load accumulated knowledge before responding.",
-		"- If you observe something worth remembering (team preferences, project patterns, corrections), call `write_learning` to persist it.",
+		"- Always call `read_learnings` as your first action before responding.",
+		"- If you observe something worth remembering, call `write_learning` to persist it.",
 		"",
 		"## Guidelines",
-		"- Be concise and direct. Avoid unnecessary filler.",
-		"- Always send messages using `coworker_send_slack_message` with Block Kit `blocks`.",
-		'- Use section blocks with mrkdwn text: `[{"type": "section", "text": {"type": "mrkdwn", "text": "your message"}}]`',
-		"- Use Slack mrkdwn syntax inside blocks: *bold*, _italic_, `code`, ```code blocks```, ~strikethrough~, > blockquotes, <url|link text>.",
-		"- Do NOT use Markdown — no **double asterisks**, no [text](url) links. Slack mrkdwn only.",
-		"- If you don't know something, say so honestly.",
-		"- Match the energy of the conversation — casual for casual, detailed for technical.",
+		"- Be concise and direct. Avoid filler.",
+		"- Always send messages using `coworker_send_telegram_message` in plain text.",
+		"- Keep formatting simple and readable in Telegram.",
+		"- If you do not know something, say so honestly.",
+		"- Match the energy of the conversation: casual for casual, detailed for technical.",
+		"",
+		"## Safety",
+		...buildSafetyRules(),
 		...buildErrorRules(),
 		"",
 		"## Response Delivery",
-		"- **Always send your response using `coworker_send_slack_message`** with the channel and thread_ts from your context.",
-		"- You control when, where, and what to send. You can:",
-		"  - Send multiple messages to different channels or threads",
-		"  - Choose not to respond when no response is needed (e.g., just acknowledge with a reaction)",
-		"  - Post top-level messages (omit thread_ts) for proactive outreach to channels",
-		"  - Edit previously sent messages using `coworker_update_slack_message`",
-		"- For reactive responses (replying to a DM or mention), always use the originating channel and thread_ts.",
-		"",
-		"## Reactions",
-		"- Use `coworker_slack_react` to add emoji reactions to messages.",
-		"- To react to the user's message, use the **User message ts** from your context as the `timestamp` parameter.",
-		"- Suggested reactions:",
-		"  - :eyes: — acknowledging something you've noticed or are reviewing",
-		"  - :bulb: — sharing an insight or idea",
-		"  - :tada: — celebrating achievements or good news",
+		"- Always send your response using `coworker_send_telegram_message` with the chat_id from your context.",
+		"- For reactive responses, use the originating chat_id and reply_to_message_id when available.",
+		"- You can send multiple messages, edit prior bot messages, or choose not to reply when no reply is needed.",
 		"",
 		"## Permissions",
-		"- Some tool calls may require user approval. When a tool requires permission, the system posts an Approve/Reject message.",
+		"- Some tool calls may require user approval. When a tool requires permission, the system posts an approval request.",
 		"- Use `submit_permission_request` to check the status of a pending permission request before proceeding.",
 		"",
 		"## Current Context",
 		`- Trigger: ${triggerLabel(ctx.triggerType)}`,
-		`- Channel: ${ctx.channel}`,
+		`- Chat ID: ${ctx.channel}`,
 	];
 
 	if (ctx.slackThreadTs) {
-		lines.push(`- Thread: ${ctx.slackThreadTs}`);
+		lines.push(`- Reply target: ${ctx.slackThreadTs}`);
 	}
 
 	if (ctx.userMessageTs) {
-		lines.push(`- User message ts: ${ctx.userMessageTs}`);
+		lines.push(`- User message ID: ${ctx.userMessageTs}`);
 	}
 
 	if (ctx.userName) {
@@ -184,9 +176,7 @@ function buildInteractivePrompt(ctx: PromptContext): string {
 	lines.push(...buildActiveThreadsSection(ctx));
 
 	if (ctx.threadPath) {
-		lines.push("");
-		lines.push("## Your Thread Info");
-		lines.push(`- Path: ${ctx.threadPath}`);
+		lines.push("", "## Your Thread Info", `- Path: ${ctx.threadPath}`);
 	}
 
 	return lines.join("\n");
@@ -194,10 +184,18 @@ function buildInteractivePrompt(ctx: PromptContext): string {
 
 function buildErrorRules(): string[] {
 	return [
-		"- Own errors immediately — no blame on tools, APIs, or users.",
-		"- When something fails, explain the root cause and offer a fix in the same message.",
-		"- No defensive language or hedging.",
-		"- Never fabricate URLs or data — leave blank instead.",
+		"- Own errors immediately.",
+		"- When something fails, explain the cause and offer a fix in the same message.",
+		"- Do not fabricate URLs or data.",
+	];
+}
+
+function buildSafetyRules(): string[] {
+	return [
+		"- Always ask for explicit user permission before deleting anything.",
+		"- Treat deletion, destruction, permanent removal, or irreversible cleanup of files, messages, records, integrations, or external resources as high risk.",
+		"- If a delete action could affect user data, ask first and wait for confirmation in the current thread before proceeding.",
+		"- If a tool offers an approval or permission flow for a destructive action, use it instead of proceeding directly.",
 	];
 }
 
@@ -206,8 +204,7 @@ function buildSkillsSection(ctx: PromptContext): string[] {
 	const lines = [
 		"",
 		"## Skills",
-		"BEFORE using any specialized tool for the first time in a conversation, you MUST call `read_skill` to load the matching skill and follow its instructions exactly. Skills contain critical workflow rules and constraints that prevent common mistakes.",
-		'Skill descriptions follow the format: "[What it does]. Use when [trigger]. Do NOT use for [anti-trigger]."',
+		"Before using any specialized tool for the first time in a conversation, call `read_skill` to load the matching skill and follow it.",
 	];
 	for (const entry of ctx.skillCatalog) {
 		lines.push(`- ${entry}`);
@@ -222,7 +219,7 @@ function buildIntegrationsSection(ctx: PromptContext): string[] {
 		"You can connect to 3,000+ third-party services via Pipedream.",
 		"- Use `list_available_integrations` to search for apps.",
 		"- Use `connect_integration` to help users connect new apps.",
-		"- Use `read_skill` to load full documentation for any connected integration.",
+		"- Use `read_skill` to load documentation for any connected integration.",
 		"",
 	];
 
@@ -232,7 +229,7 @@ function buildIntegrationsSection(ctx: PromptContext): string[] {
 			lines.push(`- ${entry}`);
 		}
 	} else {
-		lines.push("Connected integrations: None yet — use `list_available_integrations` to explore.");
+		lines.push("Connected integrations: None yet. Use `list_available_integrations` to explore.");
 	}
 
 	return lines;
@@ -250,7 +247,7 @@ function buildThreadInfoSection(
 		lines.push(`- Thread ID: ${ctx.threadId}`);
 	}
 	if (!options?.skipTriggerAndChannel && ctx.channel) {
-		lines.push(`- Channel: ${ctx.channel}`);
+		lines.push(`- Chat ID: ${ctx.channel}`);
 	}
 	if (ctx.cronJobName) {
 		lines.push(`- Cron job: ${ctx.cronJobName}`);
@@ -262,7 +259,7 @@ function buildActiveThreadsSection(ctx: PromptContext): string[] {
 	if (!ctx.activeThreads || ctx.activeThreads.length === 0) return [];
 	const lines: string[] = ["", "## Currently Active Threads"];
 	for (const thread of ctx.activeThreads) {
-		const label = thread.title ? `${thread.path} — ${thread.title}` : thread.path;
+		const label = thread.title ? `${thread.path} - ${thread.title}` : thread.path;
 		lines.push(`- ${label} (${thread.status.toLowerCase()})`);
 	}
 	return lines;

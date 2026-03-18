@@ -75,7 +75,7 @@ export default function Navbar() {
 
 				<div className="flex items-center gap-3">
 					<a
-						href="/slack/oauth/install"
+						href="/dashboard"
 						className="text-sm text-[#6B6863] hover:text-[#111] transition-colors hidden sm:block"
 					>
 						Sign in
@@ -94,7 +94,7 @@ export default function Navbar() {
 						Star
 					</a>
 					<a
-						href="/slack/oauth/install"
+						href="/dashboard"
 						className="inline-flex items-center px-4 py-2 rounded-full text-sm font-medium hover:opacity-80 transition-opacity"
 						style={{ background: "#111", color: "#fff" }}
 					>
@@ -141,11 +141,11 @@ export default function Navbar() {
 						</a>
 					))}
 					<div className="flex gap-3 pt-2 border-t border-[#d6eaef]">
-						<a href="/slack/oauth/install" className="text-sm text-[#6B6863] hover:text-[#111]">
+						<a href="/dashboard" className="text-sm text-[#6B6863] hover:text-[#111]">
 							Sign in
 						</a>
 						<a
-							href="/slack/oauth/install"
+							href="/dashboard"
 							className="inline-flex items-center px-4 py-2 rounded-full bg-[#111] text-white text-sm font-medium hover:bg-[#333] transition-colors"
 						>
 							Hire now. Free

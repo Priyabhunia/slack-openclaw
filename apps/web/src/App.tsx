@@ -35,7 +35,7 @@ export function App() {
 			<Route
 				path="/login"
 				Component={() => {
-					window.location.href = "/slack/oauth/install";
+					window.location.href = "/dashboard";
 					return null;
 				}}
 			/>

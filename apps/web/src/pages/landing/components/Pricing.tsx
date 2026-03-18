@@ -199,7 +199,7 @@ export default function Pricing() {
 
 				<div className="mt-8">
 					<a
-						href="/slack/oauth/install"
+						href="/dashboard"
 						className="inline-flex items-center px-8 py-4 rounded-full text-sm font-medium hover:opacity-80 transition-opacity"
 						style={{ background: "#111", color: "#fff" }}
 					>

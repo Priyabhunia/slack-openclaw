@@ -71,6 +71,12 @@ import {
 	createSlackToolExecutors,
 } from "./slack-comms.js";
 import {
+	coworkerDeleteTelegramMessageDefinition,
+	coworkerEditTelegramMessageDefinition,
+	coworkerSendTelegramMessageDefinition,
+	createTelegramToolExecutors,
+} from "./telegram-comms.js";
+import {
 	type ThreadOrchestrationDeps,
 	createCreateThreadExecutor,
 	createGetPathInfoExecutor,
@@ -88,6 +94,7 @@ import { workspaceTreeDefinition, workspaceTreeExecutor } from "./workspace-tree
 
 export interface RegistryConfig {
 	slackToken?: string;
+	telegramToken?: string;
 	githubToken?: string;
 	browserbaseApiKey?: string;
 	context7BaseUrl?: string;
@@ -239,6 +246,29 @@ export function createNativeRegistry(config: RegistryConfig = {}): ToolRegistry 
 			"coworker_report_issue",
 			coworkerReportIssueDefinition,
 			slackAdmin.coworker_report_issue,
+			local,
+		);
+	}
+
+	if (config.telegramToken) {
+		const telegramComms = createTelegramToolExecutors(config.telegramToken);
+		const local = { localOnly: true };
+		registry.register(
+			"coworker_send_telegram_message",
+			coworkerSendTelegramMessageDefinition,
+			telegramComms.coworker_send_telegram_message,
+			local,
+		);
+		registry.register(
+			"coworker_edit_telegram_message",
+			coworkerEditTelegramMessageDefinition,
+			telegramComms.coworker_edit_telegram_message,
+			local,
+		);
+		registry.register(
+			"coworker_delete_telegram_message",
+			coworkerDeleteTelegramMessageDefinition,
+			telegramComms.coworker_delete_telegram_message,
 			local,
 		);
 	}

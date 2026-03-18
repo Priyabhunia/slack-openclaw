@@ -36,6 +36,7 @@ import { isContextOverflow } from "./retry.js";
 const MAX_TOOL_ROUNDS = 20;
 
 const SEND_TOOL_NAMES = new Set([
+	"coworker_send_telegram_message",
 	"coworker_send_slack_message",
 	"send_message_to_thread",
 	"create_thread",

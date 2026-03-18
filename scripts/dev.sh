@@ -14,9 +14,7 @@ if [ ! -f ".env" ]; then
     echo "Created .env from docker/.env.example"
     echo ""
     echo "  Edit .env with your credentials before continuing:"
-    echo "    - SLACK_BOT_TOKEN"
-    echo "    - SLACK_APP_TOKEN"
-    echo "    - SLACK_SIGNING_SECRET"
+    echo "    - TELEGRAM_BOT_TOKEN"
     echo "    - ANTHROPIC_API_KEY (or set DEFAULT_MODEL=ollama/<model> for local LLM)"
     echo ""
     exit 1

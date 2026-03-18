@@ -38,7 +38,7 @@ if [ ! -f ".env" ]; then
   if [ -f "docker/.env.example" ]; then
     cp docker/.env.example .env
     echo "Created .env from docker/.env.example"
-    echo "Please edit .env with your Slack and Anthropic credentials."
+    echo "Please edit .env with your Telegram and LLM credentials."
     echo ""
   fi
 fi
@@ -84,7 +84,7 @@ echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Edit .env with your Slack and Anthropic credentials"
+echo "  1. Edit .env with your Telegram and LLM credentials"
 echo "  2. Run: ./scripts/dev.sh"
-echo "  3. Invite @OpenViktor to a Slack channel and mention it"
+echo "  3. Open Telegram and send a message to your bot"
 echo ""

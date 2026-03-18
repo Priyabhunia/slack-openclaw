@@ -88,7 +88,7 @@ export default function MarqueeCTA() {
 				</h3>
 				<div className="flex flex-col sm:flex-row items-center justify-center gap-4">
 					<a
-						href="/slack/oauth/install"
+						href="/dashboard"
 						className="inline-flex items-center px-8 py-4 rounded-full text-sm font-medium shrink-0 hover:opacity-80 transition-opacity"
 						style={{ background: "#fff", color: "#111" }}
 					>

@@ -13,10 +13,14 @@ const envSchema = z
 		// Deployment
 		DEPLOYMENT_MODE: z.enum(["selfhosted", "managed"]).default("selfhosted"),
 
-		// Slack (conditional per mode)
+		// Telegram
+		TELEGRAM_BOT_TOKEN: z.string().min(1).optional(),
+		TELEGRAM_BOT_USERNAME: z.string().optional(),
+
+		// Slack (legacy / managed)
 		SLACK_BOT_TOKEN: z.string().startsWith("xoxb-").optional(),
 		SLACK_APP_TOKEN: z.string().startsWith("xapp-").optional(),
-		SLACK_SIGNING_SECRET: z.string().min(1),
+		SLACK_SIGNING_SECRET: z.string().min(1).optional(),
 
 		// Slack OAuth (managed mode)
 		SLACK_CLIENT_ID: z.string().optional(),
@@ -117,15 +121,9 @@ const envSchema = z
 		if (mode === "selfhosted") {
 			requireField(
 				ctx,
-				data.SLACK_BOT_TOKEN,
-				"SLACK_BOT_TOKEN",
-				"SLACK_BOT_TOKEN is required in selfhosted mode",
-			);
-			requireField(
-				ctx,
-				data.SLACK_APP_TOKEN,
-				"SLACK_APP_TOKEN",
-				"SLACK_APP_TOKEN is required in selfhosted mode",
+				data.TELEGRAM_BOT_TOKEN,
+				"TELEGRAM_BOT_TOKEN",
+				"TELEGRAM_BOT_TOKEN is required in selfhosted mode",
 			);
 		}
 
@@ -195,7 +193,7 @@ const envSchema = z
 			);
 		}
 
-		const authMode = data.DASHBOARD_AUTH_MODE ?? (mode === "selfhosted" ? "basic" : "slack-oauth");
+		const authMode = data.DASHBOARD_AUTH_MODE ?? "basic";
 		if (authMode === "basic") {
 			requireField(
 				ctx,
@@ -266,7 +264,5 @@ export function isSelfHosted(config?: EnvConfig): boolean {
 export function getDashboardAuthMode(config?: EnvConfig): "basic" | "slack-oauth" {
 	const cfg = config ?? cachedConfig;
 	if (!cfg) throw new Error("Config not loaded. Call loadConfig() first.");
-	return (
-		cfg.DASHBOARD_AUTH_MODE ?? (cfg.DEPLOYMENT_MODE === "selfhosted" ? "basic" : "slack-oauth")
-	);
+	return cfg.DASHBOARD_AUTH_MODE ?? "basic";
 }

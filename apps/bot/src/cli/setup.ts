@@ -1,4 +1,5 @@
 import { existsSync, writeFileSync } from "node:fs";
+import process from "node:process";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { generateEncryptionKey } from "@openviktor/shared";
@@ -10,78 +11,289 @@ function escapeEnvValue(value: string): string {
 	return value;
 }
 
-const rl = createInterface({ input: process.stdin, output: process.stdout });
-const ask = (q: string): Promise<string> =>
-	new Promise((res) => rl.question(q, (a) => res(a.trim())));
+function findRepoRoot(startDir: string): string {
+	let current = resolve(startDir);
+	while (true) {
+		if (
+			existsSync(resolve(current, "docker", "docker-compose.selfhosted.yml")) &&
+			existsSync(resolve(current, "package.json"))
+		) {
+			return current;
+		}
+		const parent = resolve(current, "..");
+		if (parent === current) {
+			return startDir;
+		}
+		current = parent;
+	}
+}
 
-async function main() {
-	console.log("\n  OpenViktor Setup\n");
-	console.log("  This wizard will guide you through first-time setup.\n");
+type SetupFlags = {
+	telegramBotToken?: string;
+	telegramBotUsername?: string;
+	useOllama?: boolean;
+	anthropicApiKey?: string;
+	openaiApiKey?: string;
+	googleAiApiKey?: string;
+	ollamaModel?: string;
+	ollamaBaseUrl?: string;
+	dashboardPassword?: string;
+	dbPassword?: string;
+	overwrite?: boolean;
+	help?: boolean;
+};
 
-	// Check for existing .env
-	const envPath = resolve(process.cwd(), ".env");
-	if (existsSync(envPath)) {
-		const overwrite = await ask("  .env file already exists. Overwrite? (y/N): ");
-		if (overwrite.toLowerCase() !== "y") {
-			console.log("  Setup cancelled.\n");
-			process.exit(0);
+function parseFlags(argv: string[]): SetupFlags {
+	const flags: SetupFlags = {};
+
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		const next = argv[i + 1];
+
+		switch (arg) {
+			case "--telegram-bot-token":
+				flags.telegramBotToken = next;
+				i++;
+				break;
+			case "--telegram-bot-username":
+				flags.telegramBotUsername = next;
+				i++;
+				break;
+			case "--use-ollama":
+				flags.useOllama = true;
+				break;
+			case "--anthropic-api-key":
+				flags.anthropicApiKey = next;
+				i++;
+				break;
+			case "--openai-api-key":
+				flags.openaiApiKey = next;
+				i++;
+				break;
+			case "--google-ai-api-key":
+				flags.googleAiApiKey = next;
+				i++;
+				break;
+			case "--ollama-model":
+				flags.ollamaModel = next;
+				i++;
+				break;
+			case "--ollama-base-url":
+				flags.ollamaBaseUrl = next;
+				i++;
+				break;
+			case "--dashboard-password":
+				flags.dashboardPassword = next;
+				i++;
+				break;
+			case "--db-password":
+				flags.dbPassword = next;
+				i++;
+				break;
+			case "--overwrite":
+				flags.overwrite = true;
+				break;
+			case "--help":
+			case "-h":
+				flags.help = true;
+				break;
 		}
 	}
 
-	// Step 1: Slack App
-	console.log("\n  Step 1: Slack App");
-	console.log("  ─────────────────");
-	console.log("  Create a Slack app at https://api.slack.com/apps");
-	console.log("  Tip: Use the manifest file at slack-app-manifest.yml for one-click setup.\n");
+	return flags;
+}
 
-	const botToken = await ask("  Bot Token (xoxb-...): ");
-	if (!botToken.startsWith("xoxb-")) {
-		console.error("  Error: Bot token must start with xoxb-");
-		process.exit(1);
+function printHelp(): void {
+	console.log(`
+OpenViktor setup
+
+Interactive:
+  bun src/cli/setup.ts
+
+Non-interactive:
+  bun src/cli/setup.ts --telegram-bot-token <token> --dashboard-password <password> [options]
+
+Options:
+  --telegram-bot-token <token>
+  --telegram-bot-username <username>
+  --use-ollama
+  --anthropic-api-key <key>
+  --openai-api-key <key>
+  --google-ai-api-key <key>
+  --ollama-model <model>
+  --ollama-base-url <url>
+  --dashboard-password <password>
+  --db-password <password>
+  --overwrite
+  --help
+`);
+}
+
+const flags = parseFlags(process.argv.slice(2));
+const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+const rl = interactive ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+
+async function ask(question: string): Promise<string> {
+	if (!rl) {
+		throw new Error(`Interactive input is unavailable for: ${question}`);
+	}
+	return new Promise((resolveAnswer) => rl.question(question, (answer) => resolveAnswer(answer.trim())));
+}
+
+async function getValue(
+	label: string,
+	value: string | undefined,
+	question: string,
+	options?: { optional?: boolean; defaultValue?: string },
+): Promise<string> {
+	if (value !== undefined && value !== "") {
+		return value;
+	}
+	if (!interactive) {
+		if (options?.defaultValue !== undefined) return options.defaultValue;
+		if (options?.optional) return "";
+		throw new Error(
+			`Missing required value for ${label}. Re-run with --help and pass flags, or use an interactive terminal.`,
+		);
 	}
 
-	const appToken = await ask("  App Token (xapp-...): ");
-	if (!appToken.startsWith("xapp-")) {
-		console.error("  Error: App token must start with xapp-");
-		process.exit(1);
+	const answer = await ask(question);
+	if (answer) return answer;
+	if (options?.defaultValue !== undefined) return options.defaultValue;
+	if (options?.optional) return "";
+	throw new Error(`${label} is required`);
+}
+
+async function askYesNo(question: string, defaultValue = false): Promise<boolean> {
+	if (!interactive) {
+		return defaultValue;
 	}
 
-	const signingSecret = await ask("  Signing Secret: ");
-	if (!signingSecret) {
-		console.error("  Error: Signing secret is required");
-		process.exit(1);
+	const suffix = defaultValue ? "Y/n" : "y/N";
+	const answer = (await ask(`${question} (${suffix}): `)).toLowerCase();
+	if (!answer) {
+		return defaultValue;
+	}
+	return answer === "y" || answer === "yes";
+}
+
+async function main() {
+	if (flags.help) {
+		printHelp();
+		return;
 	}
 
-	// Step 2: LLM
+	console.log("\n  OpenViktor Setup\n");
+	console.log("  This wizard configures OpenViktor for Telegram-first self-hosting.\n");
+
+	const repoRoot = findRepoRoot(process.cwd());
+	const envPath = resolve(repoRoot, ".env");
+	if (existsSync(envPath)) {
+		if (flags.overwrite !== true) {
+			if (!interactive) {
+				throw new Error(".env already exists. Re-run with --overwrite to replace it.");
+			}
+			const overwrite = await ask("  .env file already exists. Overwrite? (y/N): ");
+			if (overwrite.toLowerCase() !== "y") {
+				console.log("  Setup cancelled.\n");
+				return;
+			}
+		}
+	}
+
+	console.log("\n  Step 1: Telegram Bot");
+	console.log("  Create a bot with @BotFather, then paste the HTTP API token here.\n");
+
+	const telegramBotToken = await getValue(
+		"TELEGRAM_BOT_TOKEN",
+		flags.telegramBotToken ?? process.env.TELEGRAM_BOT_TOKEN,
+		"  Telegram Bot Token: ",
+	);
+	if (!telegramBotToken.includes(":")) {
+		throw new Error("Telegram bot token should look like <id>:<secret>");
+	}
+
+	const telegramBotUsername = await getValue(
+		"TELEGRAM_BOT_USERNAME",
+		flags.telegramBotUsername ?? process.env.TELEGRAM_BOT_USERNAME,
+		"  Telegram Bot Username (optional): ",
+		{ optional: true },
+	);
+
 	console.log("\n  Step 2: LLM Provider");
-	console.log("  ────────────────────");
+	console.log("  Choose Ollama for local models, or cloud keys if you need hosted models.\n");
 
-	const anthropicKey = await ask("  Anthropic API Key (sk-ant-...): ");
-	if (!anthropicKey) {
-		console.error("  Error: Anthropic API key is required");
-		process.exit(1);
+	const useOllama =
+		flags.useOllama === true ||
+		Boolean(flags.ollamaModel || process.env.OLLAMA_MODEL) ||
+		(await askYesNo("  Use Ollama/local model?", true));
+
+	const anthropicKey = useOllama
+		? ""
+		: await getValue(
+				"ANTHROPIC_API_KEY",
+				flags.anthropicApiKey ?? process.env.ANTHROPIC_API_KEY,
+				"  Anthropic API Key (optional, press Enter to skip): ",
+				{ optional: true },
+			);
+	const openaiKey = useOllama
+		? ""
+		: await getValue(
+				"OPENAI_API_KEY",
+				flags.openaiApiKey ?? process.env.OPENAI_API_KEY,
+				"  OpenAI API Key (optional, press Enter to skip): ",
+				{ optional: true },
+			);
+	const googleKey = useOllama
+		? ""
+		: await getValue(
+				"GOOGLE_AI_API_KEY",
+				flags.googleAiApiKey ?? process.env.GOOGLE_AI_API_KEY,
+				"  Google AI API Key (optional, press Enter to skip): ",
+				{ optional: true },
+			);
+	const ollamaModel = useOllama
+		? await getValue(
+				"OLLAMA_MODEL",
+				flags.ollamaModel ?? process.env.OLLAMA_MODEL,
+				"  Ollama model (e.g. llama3.2): ",
+			)
+		: await getValue(
+				"OLLAMA_MODEL",
+				flags.ollamaModel ?? process.env.OLLAMA_MODEL,
+				"  Ollama model (optional, e.g. llama3.2, press Enter to skip): ",
+				{ optional: true },
+			);
+	const ollamaBaseUrl = ollamaModel
+		? await getValue(
+				"OLLAMA_BASE_URL",
+				flags.ollamaBaseUrl ?? process.env.OLLAMA_BASE_URL,
+				"  Ollama base URL (default: http://localhost:11434): ",
+				{ optional: true, defaultValue: "http://localhost:11434" },
+			)
+		: "";
+
+	if (!anthropicKey && !openaiKey && !googleKey && !ollamaModel) {
+		throw new Error("Provide at least one cloud API key or an Ollama model");
 	}
 
-	const openaiKey = await ask("  OpenAI API Key (optional, press Enter to skip): ");
-	const googleKey = await ask("  Google AI API Key (optional, press Enter to skip): ");
-
-	// Step 3: Dashboard
 	console.log("\n  Step 3: Dashboard");
-	console.log("  ─────────────────");
+	console.log("  Press Enter to auto-generate a dashboard password.\n");
 
-	const dashboardPassword = await ask("  Dashboard password (admin login): ");
-	if (!dashboardPassword) {
-		console.error("  Error: Dashboard password is required");
-		process.exit(1);
-	}
+	const dashboardPassword = await getValue(
+		"DASHBOARD_PASSWORD",
+		flags.dashboardPassword ?? process.env.DASHBOARD_PASSWORD,
+		"  Dashboard password (admin login): ",
+		{ defaultValue: generateEncryptionKey().slice(0, 24) },
+	);
 
-	// Step 4: Database
 	console.log("\n  Step 4: Database");
-	console.log("  ────────────────");
-
-	const dbPassword = (await ask("  PostgreSQL password (default: openviktor): ")) || "openviktor";
-
-	// Generate config
+	const dbPassword = await getValue(
+		"POSTGRES_PASSWORD",
+		flags.dbPassword ?? process.env.POSTGRES_PASSWORD,
+		"  PostgreSQL password (press Enter for auto-generated): ",
+		{ defaultValue: generateEncryptionKey().slice(0, 24) },
+	);
 	const encryptionKey = generateEncryptionKey();
 
 	const envContent = [
@@ -91,18 +303,23 @@ async function main() {
 		"# Deployment",
 		"DEPLOYMENT_MODE=selfhosted",
 		"",
-		"# Slack",
-		`SLACK_BOT_TOKEN=${escapeEnvValue(botToken)}`,
-		`SLACK_APP_TOKEN=${escapeEnvValue(appToken)}`,
-		`SLACK_SIGNING_SECRET=${escapeEnvValue(signingSecret)}`,
+		"# Telegram",
+		`TELEGRAM_BOT_TOKEN=${escapeEnvValue(telegramBotToken)}`,
+		...(telegramBotUsername
+			? [`TELEGRAM_BOT_USERNAME=${escapeEnvValue(telegramBotUsername)}`]
+			: []),
 		"",
 		"# LLM",
-		`ANTHROPIC_API_KEY=${escapeEnvValue(anthropicKey)}`,
+		...(anthropicKey ? [`ANTHROPIC_API_KEY=${escapeEnvValue(anthropicKey)}`] : []),
 		...(openaiKey ? [`OPENAI_API_KEY=${escapeEnvValue(openaiKey)}`] : []),
 		...(googleKey ? [`GOOGLE_AI_API_KEY=${escapeEnvValue(googleKey)}`] : []),
+		...(ollamaModel ? [`DEFAULT_MODEL=ollama/${escapeEnvValue(ollamaModel)}`] : []),
+		...(ollamaModel && ollamaBaseUrl
+			? [`OLLAMA_BASE_URL=${escapeEnvValue(ollamaBaseUrl)}`]
+			: []),
 		"",
 		"# Database",
-		`DATABASE_URL=postgresql://openviktor:${escapeEnvValue(dbPassword)}@postgres:5432/openviktor`,
+		`DATABASE_URL=postgresql://openviktor:${encodeURIComponent(dbPassword)}@postgres:5432/openviktor`,
 		`POSTGRES_PASSWORD=${escapeEnvValue(dbPassword)}`,
 		"",
 		"# Redis",
@@ -112,6 +329,7 @@ async function main() {
 		"DASHBOARD_AUTH_MODE=basic",
 		"DASHBOARD_USERNAME=admin",
 		`DASHBOARD_PASSWORD=${escapeEnvValue(dashboardPassword)}`,
+		"ENABLE_DASHBOARD=true",
 		"",
 		"# Security",
 		`ENCRYPTION_KEY=${encryptionKey}`,
@@ -124,18 +342,19 @@ async function main() {
 
 	writeFileSync(envPath, envContent, "utf-8");
 	console.log(`\n  .env written to ${envPath}`);
-
-	// Step 5: Start
+	console.log("  If you left a password blank, the generated value is stored in that .env file.");
 	console.log("\n  Setup complete!");
-	console.log("  ───────────────");
-	console.log("  To start OpenViktor:");
+	console.log("  Start the stack with:");
 	console.log("    docker compose -f docker/docker-compose.selfhosted.yml up -d\n");
-	console.log("  Dashboard: http://localhost:3001 (login: admin / your password)\n");
-
-	rl.close();
+	console.log("  Then open Telegram, send a message to your bot, and watch OpenViktor reply.");
+	console.log("  Dashboard: http://localhost:3001\n");
 }
 
-main().catch((err) => {
-	console.error("Setup failed:", err.message);
-	process.exit(1);
-});
+main()
+	.catch((err) => {
+		console.error(`  Error: ${err.message}`);
+		process.exitCode = 1;
+	})
+	.finally(() => {
+		rl?.close();
+	});

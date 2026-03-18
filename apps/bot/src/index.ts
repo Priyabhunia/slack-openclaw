@@ -1,19 +1,17 @@
 import { prisma } from "@openviktor/db";
 import { PipedreamClient } from "@openviktor/integrations";
 import type { PipedreamConfig } from "@openviktor/integrations";
-import { createLogger, isManaged, isSelfHosted, loadConfig } from "@openviktor/shared";
+import { createLogger, isManaged, loadConfig } from "@openviktor/shared";
 import {
 	ConcurrencyExceededError,
 	type Logger,
 	ThreadLockedError,
 	chunkMessage,
-	markdownToMrkdwn,
 } from "@openviktor/shared";
 import {
 	LocalToolBackend,
 	ModalToolBackend,
 	ToolGatewayClient,
-	appendSlackLog,
 	connectIntegrationDefinition,
 	createConnectIntegrationExecutor,
 	createDisconnectIntegrationExecutor,
@@ -28,58 +26,21 @@ import {
 	listAvailableIntegrationsDefinition,
 	listWorkspaceConnectionsDefinition,
 	registerDbTools,
-	registerDynamicSlackTools,
 	registerSpacesTools,
-	registerThreadOrchestrationTools,
 	restoreToolsFromDb,
 	submitPermissionRequestDefinition,
 	syncWorkspaceConnectionsDefinition,
 } from "@openviktor/tools";
-import type { SpawnAgentRunParams } from "@openviktor/tools";
 import type { RegistryConfig, ToolBackend } from "@openviktor/tools";
 import { ConvexClient, SpacesService, VercelClient } from "@openviktor/tools/spaces";
 import { LLMGateway } from "./agent/gateway.js";
 import { AnthropicProvider } from "./agent/providers/anthropic.js";
 import { AgentRunner } from "./agent/runner.js";
-import {
-	CronScheduler,
-	createCronJobDefinition,
-	createCronToolExecutors,
-	createScriptCronDefinition,
-	deleteCronJobDefinition,
-	listCronJobsDefinition,
-	triggerCronJobDefinition,
-} from "./cron/index.js";
-import {
-	buildOnboardingPrompt,
-	buildProactiveOnboardingPrompt,
-	isOnboardingNeeded,
-	markOnboardingComplete,
-	seedChannelIntros,
-} from "./cron/onboarding.js";
+import { createCronJobDefinition, createCronToolExecutors, createScriptCronDefinition, CronScheduler, deleteCronJobDefinition, listCronJobsDefinition, triggerCronJobDefinition } from "./cron/index.js";
+import { buildOnboardingPrompt, isOnboardingNeeded, markOnboardingComplete, seedChannelIntros } from "./cron/onboarding.js";
 import { IntegrationWatcher } from "./integrations/watcher.js";
 import { seedBuiltinSkills } from "./skills/seed.js";
-import {
-	ConnectionManager,
-	type EventHandler,
-	type InteractionHandler,
-	type SlackConnection,
-	type SlackEvent,
-} from "./slack/connection-manager.js";
-import { createEventsApiHandler } from "./slack/events-api.js";
-import {
-	buildPermissionMessage,
-	createBotFilter,
-	createDeduplicator,
-	createSlackApp,
-	registerEventHandlers,
-	registerInteractionHandlers,
-	startSlackApp,
-} from "./slack/index.js";
-import { createOAuthHandler } from "./slack/oauth.js";
-import { resolveMember, resolveUserMentions, resolveWorkspace } from "./slack/resolve.js";
-import type { SlackClient } from "./slack/resolve.js";
-import { createSpacesApi } from "./spaces/api.js";
+import { TelegramApi, type TelegramMessage, type TelegramUser } from "./telegram/api.js";
 import { createConcurrencyLimiter } from "./thread/concurrency.js";
 import { fetchActiveThreads } from "./thread/index.js";
 import { ThreadLock } from "./thread/lock.js";
@@ -88,6 +49,7 @@ import { createDashboardApi } from "./tool-gateway/dashboard-api.js";
 import { createToolGateway, registerWorkspaceToken } from "./tool-gateway/server.js";
 import { UsageLimiter } from "./usage/limiter.js";
 import { UsageTracker } from "./usage/tracker.js";
+import { createSpacesApi } from "./spaces/api.js";
 
 const logger = createLogger("bot");
 
@@ -100,7 +62,7 @@ function createToolBackend(config: ReturnType<typeof loadConfig>): {
 		llmProvider = new AnthropicProvider(config.ANTHROPIC_API_KEY);
 	}
 	const registryConfig: RegistryConfig = {
-		slackToken: config.SLACK_BOT_TOKEN ?? "",
+		telegramToken: config.TELEGRAM_BOT_TOKEN,
 		githubToken: config.GITHUB_TOKEN,
 		browserbaseApiKey: config.BROWSERBASE_API_KEY,
 		context7BaseUrl: config.CONTEXT7_BASE_URL,
@@ -127,48 +89,194 @@ function createToolBackend(config: ReturnType<typeof loadConfig>): {
 	return { backend, registry };
 }
 
-// ─── Deduplication for unified event handler ────────────
+function getDisplayName(user?: TelegramUser): string | null {
+	if (!user) return null;
+	const fullName = [user.first_name, user.last_name].filter(Boolean).join(" ").trim();
+	return fullName || user.username || String(user.id);
+}
 
-function createEventDeduplicator(ttlMs = 300_000) {
-	const seen = new Map<string, number>();
-	return (key: string): boolean => {
-		const now = Date.now();
-		const seenAt = seen.get(key);
-		if (seenAt !== undefined && now - seenAt < ttlMs) return true;
-		seen.set(key, now);
-		// Periodic cleanup
-		if (seen.size > 10_000) {
-			for (const [k, ts] of seen) {
-				if (now - ts > ttlMs) seen.delete(k);
-			}
-		}
-		return false;
+function normalizeIncomingText(message: TelegramMessage, botUsername?: string): string {
+	const raw = (message.text ?? message.caption ?? "").trim();
+	if (!raw || !botUsername) return raw;
+	const mentionPattern = new RegExp(`@${botUsername}\\b`, "ig");
+	return raw.replace(mentionPattern, "").replace(/\s{2,}/g, " ").trim() || raw;
+}
+
+function isTelegramSlashCommand(message: TelegramMessage, botUsername?: string): boolean {
+	const raw = (message.text ?? message.caption ?? "").trim();
+	if (!raw.startsWith("/")) return false;
+	if (!botUsername) return true;
+	const firstToken = raw.split(/\s+/, 1)[0] ?? raw;
+	const commandWithoutSlash = firstToken.slice(1);
+	const [commandName, commandTarget] = commandWithoutSlash.split("@", 2);
+	if (!commandName) return false;
+	return !commandTarget || commandTarget.toLowerCase() === botUsername.toLowerCase();
+}
+
+function normalizeSlashCommand(rawText: string, botUsername?: string): string {
+	const trimmed = rawText.trim();
+	if (!trimmed.startsWith("/")) return trimmed;
+
+	const [firstToken, ...rest] = trimmed.split(/\s+/);
+	const commandWithTarget = firstToken.slice(1);
+	const [commandName] = commandWithTarget.split("@", 2);
+	const args = rest.join(" ").trim();
+
+	switch (commandName.toLowerCase()) {
+		case "start":
+			return "Introduce yourself, explain how to use you in this Telegram chat, and give 3 practical example prompts.";
+		case "help":
+			return "Explain how to use you in Telegram, including direct messages, group mentions, replies, tools, and integrations.";
+		case "tools":
+			return "List the tools and capabilities you support in this workspace. Group them by category and keep it concise.";
+		case "status":
+			return "Summarize your current status in this workspace, including connected integrations if any, available skills, and what you can help with right now.";
+		case "new":
+			return args
+				? `Treat this as a fresh request with no dependency on earlier chat context: ${args}`
+				: "Treat the next response as a fresh conversation starter and ask what the user wants help with.";
+		default:
+			return args ? `${commandName} ${args}` : commandName;
+	}
+}
+
+function shouldHandleMessage(
+	message: TelegramMessage,
+	botProfile: TelegramUser,
+	botUsername?: string,
+): { handle: boolean; triggerType: "DM" | "MENTION"; threadTs: string } {
+	const isDm = message.chat.type === "private";
+	const isSlashCommand = isTelegramSlashCommand(message, botUsername);
+	if (isDm) {
+		return { handle: true, triggerType: "DM", threadTs: String(message.message_id) };
+	}
+
+	const text = message.text ?? message.caption ?? "";
+	const mentioned = botUsername
+		? new RegExp(`(^|\\s)@${botUsername}\\b`, "i").test(text)
+		: false;
+	const repliedToBot = message.reply_to_message?.from?.id === botProfile.id;
+
+	if (!mentioned && !repliedToBot && !isSlashCommand) {
+		return { handle: false, triggerType: "MENTION", threadTs: String(message.message_id) };
+	}
+
+	return {
+		handle: true,
+		triggerType: "MENTION",
+		threadTs: String(message.reply_to_message?.message_id ?? message.message_id),
 	};
 }
 
-// ─── Main ───────────────────────────────────────────────
+async function resolveWorkspace(botProfile: TelegramUser, token: string) {
+	const syntheticTeamId = `telegram:${botProfile.id}`;
+	const workspaceName = botProfile.username ? `Telegram @${botProfile.username}` : "Telegram";
 
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: top-level orchestration of all bot subsystems and server setup
+	const existing = await prisma.workspace.findUnique({
+		where: { slackTeamId: syntheticTeamId },
+	});
+	if (existing) return existing;
+
+	return prisma.workspace.create({
+		data: {
+			slackTeamId: syntheticTeamId,
+			slackTeamName: workspaceName,
+			slackBotToken: token,
+			slackBotUserId: String(botProfile.id),
+			settings: { transport: "telegram" },
+		},
+	});
+}
+
+async function resolveMember(workspaceId: string, user: TelegramUser) {
+	return prisma.member.upsert({
+		where: {
+			workspaceId_slackUserId: {
+				workspaceId,
+				slackUserId: String(user.id),
+			},
+		},
+		update: {
+			displayName: getDisplayName(user),
+			profile: {
+				username: user.username ?? null,
+				firstName: user.first_name ?? null,
+				lastName: user.last_name ?? null,
+				transport: "telegram",
+			},
+		},
+		create: {
+			workspaceId,
+			slackUserId: String(user.id),
+			displayName: getDisplayName(user),
+			profile: {
+				username: user.username ?? null,
+				firstName: user.first_name ?? null,
+				lastName: user.last_name ?? null,
+				transport: "telegram",
+			},
+		},
+	});
+}
+
+async function fetchSkillCatalog(workspaceId: string): Promise<string[]> {
+	const skills = await prisma.skill.findMany({
+		where: { workspaceId },
+		select: { name: true, description: true, version: true },
+		orderBy: { name: "asc" },
+	});
+	return skills.map((s) => {
+		const desc = s.description ? ` - ${s.description}` : "";
+		return `${s.name} (v${s.version})${desc}`;
+	});
+}
+
+async function fetchIntegrationCatalog(workspaceId: string): Promise<string[]> {
+	const skills = await prisma.skill.findMany({
+		where: { workspaceId, name: { startsWith: "pd_" } },
+		select: { name: true, description: true },
+		orderBy: { name: "asc" },
+	});
+	return skills.map((s) => {
+		const appName = s.name.replace(/^pd_/, "");
+		const desc = s.description ?? appName;
+		return `${appName}: ${desc}`;
+	});
+}
+
+async function sendTelegramReply(
+	api: TelegramApi,
+	chatId: string,
+	text: string,
+	replyToMessageId?: string,
+): Promise<void> {
+	for (const chunk of chunkMessage(text, 4096).filter((entry) => entry.trim().length > 0)) {
+		await api.sendMessage(chatId, chunk, replyToMessageId);
+	}
+}
+
 async function main(): Promise<void> {
 	const config = loadConfig();
-	const mode = config.DEPLOYMENT_MODE;
+	if (isManaged(config)) {
+		throw new Error("Managed mode is not supported in the Telegram-first build.");
+	}
+	if (!config.TELEGRAM_BOT_TOKEN) {
+		throw new Error("TELEGRAM_BOT_TOKEN is required.");
+	}
 
 	await prisma.$connect();
-	logger.info({ mode }, "Database connected");
+	logger.info({ mode: config.DEPLOYMENT_MODE }, "Database connected");
 
 	const { backend, registry } = createToolBackend(config);
-	const gatewayDeps = {
+	const gateway = createToolGateway({
 		registry,
 		backend,
 		logger: createLogger("tool-gateway"),
 		defaultTimeoutMs: config.TOOL_TIMEOUT_MS,
-	};
-	const gateway = createToolGateway(gatewayDeps);
-
-	const gatewayPort = config.TOOL_GATEWAY_PORT;
+	});
 
 	const gatewayClient = new ToolGatewayClient({
-		baseUrl: `http://localhost:${gatewayPort}`,
+		baseUrl: `http://localhost:${config.TOOL_GATEWAY_PORT}`,
 		token: "local",
 		timeoutMs: config.TOOL_TIMEOUT_MS,
 	});
@@ -196,9 +304,11 @@ async function main(): Promise<void> {
 	staleDetector.start();
 
 	const usageTracker = new UsageTracker(prisma, createLogger("usage-tracker"));
-	const usageLimiter = isManaged(config)
-		? new UsageLimiter(prisma, createLogger("usage-limiter"), config.GLOBAL_MONTHLY_BUDGET_CENTS)
-		: null;
+	const usageLimiter = new UsageLimiter(
+		prisma,
+		createLogger("usage-limiter"),
+		config.GLOBAL_MONTHLY_BUDGET_CENTS,
+	);
 
 	const llm = new LLMGateway(config);
 	const runner = new AgentRunner(
@@ -216,31 +326,10 @@ async function main(): Promise<void> {
 		},
 	);
 
-	// Thread orchestration tools
-	registerThreadOrchestrationTools(registry, {
-		prisma,
-		slackToken: config.SLACK_BOT_TOKEN ?? "",
-		spawnAgentRun: (params: SpawnAgentRunParams) => {
-			void runner.run({
-				workspaceId: params.workspaceId,
-				memberId: null,
-				triggerType: "SPAWN",
-				slackChannel: params.slackChannel,
-				slackThreadTs: params.slackThreadTs,
-				userMessage: params.initialPrompt,
-				promptContext: {
-					workspaceName: "",
-					channel: params.slackChannel,
-					triggerType: "SPAWN",
-				},
-			});
-		},
-	});
-
 	const scheduler = new CronScheduler(prisma, runner, createLogger("cron-scheduler"), {
 		checkIntervalMs: config.CRON_CHECK_INTERVAL_MS,
 		heartbeatEnabled: config.HEARTBEAT_ENABLED,
-		slackToken: config.SLACK_BOT_TOKEN ?? "",
+		slackToken: config.TELEGRAM_BOT_TOKEN,
 		defaultModel: config.DEFAULT_MODEL,
 		encryptionKey: config.ENCRYPTION_KEY,
 		backend,
@@ -249,22 +338,11 @@ async function main(): Promise<void> {
 	const cronTools = createCronToolExecutors(prisma, scheduler);
 	const local = { localOnly: true };
 	registry.register("create_cron_job", createCronJobDefinition, cronTools.create_cron_job, local);
-	registry.register(
-		"create_script_cron",
-		createScriptCronDefinition,
-		cronTools.create_script_cron,
-		local,
-	);
+	registry.register("create_script_cron", createScriptCronDefinition, cronTools.create_script_cron, local);
 	registry.register("delete_cron_job", deleteCronJobDefinition, cronTools.delete_cron_job, local);
-	registry.register(
-		"trigger_cron_job",
-		triggerCronJobDefinition,
-		cronTools.trigger_cron_job,
-		local,
-	);
+	registry.register("trigger_cron_job", triggerCronJobDefinition, cronTools.trigger_cron_job, local);
 	registry.register("list_cron_jobs", listCronJobsDefinition, cronTools.list_cron_jobs, local);
 
-	// Spaces tools
 	let spacesApi: ReturnType<typeof createSpacesApi> | undefined;
 	if (config.CONVEX_ACCESS_TOKEN && config.CONVEX_TEAM_ID && config.VERCEL_TOKEN) {
 		const convexClient = new ConvexClient({
@@ -291,10 +369,8 @@ async function main(): Promise<void> {
 			defaultTimeoutMs: config.TOOL_TIMEOUT_MS,
 			resendApiKey: config.RESEND_API_KEY,
 		});
-		logger.info("Spaces tools registered");
 	}
 
-	// Pipedream integration tools
 	let integrationWatcher: IntegrationWatcher | undefined;
 	let pdClient: PipedreamClient | undefined;
 	let syncHandler: ReturnType<typeof createIntegrationSyncHandler> | undefined;
@@ -311,9 +387,12 @@ async function main(): Promise<void> {
 			environment: config.PIPEDREAM_ENVIRONMENT,
 		};
 		pdClient = new PipedreamClient(pdConfig);
-		const skipPermissions = config.DANGEROUSLY_SKIP_PERMISSIONS;
-
-		syncHandler = createIntegrationSyncHandler(registry, pdClient, prisma, skipPermissions);
+		syncHandler = createIntegrationSyncHandler(
+			registry,
+			pdClient,
+			prisma,
+			config.DANGEROUSLY_SKIP_PERMISSIONS,
+		);
 
 		const refreshRunnerTools = () => {
 			runner.updateToolConfig({
@@ -368,14 +447,7 @@ async function main(): Promise<void> {
 			local,
 		);
 
-		const restored = await restoreToolsFromDb(registry, pdClient, prisma, skipPermissions);
-		if (restored.length > 0) {
-			logger.info({ count: restored.length }, "Restored Pipedream tools from database");
-		}
-
-		logger.info("Pipedream integration enabled");
-	} else {
-		logger.info("Pipedream integration disabled (no credentials configured)");
+		await restoreToolsFromDb(registry, pdClient, prisma, config.DANGEROUSLY_SKIP_PERMISSIONS);
 	}
 
 	runner.updateToolConfig({
@@ -383,7 +455,6 @@ async function main(): Promise<void> {
 		tools: registry.getDefinitions(),
 	});
 
-	// Deploy Python SDK to all active workspaces
 	const allTools = registry.getAllDefinitions();
 	prisma.workspace
 		.findMany({ select: { id: true } })
@@ -391,466 +462,21 @@ async function main(): Promise<void> {
 			for (const ws of workspaces) {
 				await deploySdkToWorkspace(ws.id, allTools).catch(() => {});
 			}
-			if (workspaces.length > 0) {
-				logger.info({ count: workspaces.length }, "Deployed Python SDK to workspaces");
-			}
 		})
 		.catch((err) => logger.warn({ err }, "Failed to deploy SDK to workspaces"));
 
 	scheduler.start();
-
-	// ─── Unified event handler ──────────────────────────
-
-	const isDuplicate = createEventDeduplicator();
-	const eventLogger = createLogger("events");
-
-	async function fetchSkillCatalog(workspaceId: string): Promise<string[]> {
-		const skills = await prisma.skill.findMany({
-			where: { workspaceId },
-			select: { name: true, description: true, version: true },
-			orderBy: { name: "asc" },
-		});
-		return skills.map((s) => {
-			const desc = s.description ? ` — ${s.description}` : "";
-			return `${s.name} (v${s.version})${desc}`;
-		});
-	}
-
-	async function fetchIntegrationCatalog(workspaceId: string): Promise<string[]> {
-		const skills = await prisma.skill.findMany({
-			where: { workspaceId, name: { startsWith: "pd_" } },
-			select: { name: true, description: true },
-			orderBy: { name: "asc" },
-		});
-		return skills.map((s) => {
-			const appName = s.name.replace(/^pd_/, "");
-			const desc = s.description ?? appName;
-			return `${appName}: ${desc}`;
-		});
-	}
-
-	async function addReaction(
-		client: SlackClient,
-		channel: string,
-		timestamp: string,
-		emoji: string,
-	): Promise<void> {
-		try {
-			await client.reactions.add({ channel, timestamp, name: emoji });
-		} catch (err) {
-			eventLogger.warn({ err, channel, timestamp, emoji }, "Failed to add reaction");
-		}
-	}
-
-	async function removeReaction(
-		client: SlackClient,
-		channel: string,
-		timestamp: string,
-		emoji: string,
-	): Promise<void> {
-		try {
-			await client.reactions.remove({ channel, timestamp, name: emoji });
-		} catch (err) {
-			eventLogger.warn({ err, channel, timestamp, emoji }, "Failed to remove reaction");
-		}
-	}
-
-	async function sendResponse(
-		say: (opts: { text: string; thread_ts?: string }) => Promise<unknown>,
-		responseText: string,
-		threadTs: string,
-	): Promise<void> {
-		const text = responseText.trim();
-		if (!text) return;
-		const mrkdwn = markdownToMrkdwn(text);
-		const chunks = chunkMessage(mrkdwn).filter((c) => c.trim().length > 0);
-		if (chunks.length === 0) chunks.push(text);
-		for (const chunk of chunks) {
-			await say({ text: chunk, thread_ts: threadTs });
-		}
-	}
-
-	async function safeReply(
-		say: (opts: { text: string; thread_ts?: string }) => Promise<unknown>,
-		threadTs?: string,
-		text?: string,
-	): Promise<void> {
-		try {
-			await say({
-				text:
-					text ??
-					"Something went wrong while processing your request. Let me know if you'd like me to try again.",
-				thread_ts: threadTs,
-			});
-		} catch (err) {
-			eventLogger.warn({ err, threadTs }, "Failed to send error reply");
-		}
-	}
-
-	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: event routing with deduplication, thread resolution, and multi-step agent dispatch
-	const onEvent: EventHandler = async (event, connection, say) => {
-		// Deduplication
-		const dedupeKey = `${event.channel}:${event.ts}`;
-		if (isDuplicate(dedupeKey)) return;
-
-		// Bot filter
-		if (event.botId || event.subtype === "bot_message") return;
-		if (!event.user || !event.text) return;
-		if (event.user === connection.botUserId) return;
-
-		const client = connection.getClient() as unknown as SlackClient;
-		const workspaceId = connection.workspaceId;
-		const botUserId = connection.botUserId;
-
-		// Register workspace token for tool gateway
-		registerWorkspaceToken("local", workspaceId);
-
-		if (event.type === "message") {
-			const isDm = event.channelType === "im";
-			if (!isDm && !event.threadTs) return;
-
-			// Check if bot is participating in thread
-			if (!isDm && event.threadTs) {
-				const participating = await prisma.thread.findFirst({
-					where: {
-						workspace: { slackTeamId: event.teamId },
-						slackChannel: event.channel,
-						slackThreadTs: event.threadTs,
-					},
-				});
-				if (!participating) return;
-			}
-		}
-
-		const threadTs = event.threadTs ?? event.ts;
-
-		// Resolve workspace (ensure it exists in DB)
-		const workspace = await resolveWorkspace(
-			prisma,
-			client,
-			event.teamId,
-			connection.getClient().token as string,
-			botUserId,
-		);
-
-		// Resolve member
-		const member = await resolveMember(prisma, client, workspace.id, event.user);
-
-		// Log to Slack log
-		appendSlackLog({
-			workspaceId: workspace.id,
-			channel: event.channel,
-			ts: event.ts,
-			threadTs: event.threadTs,
-			username: member.displayName ?? event.user,
-			text: event.text,
-		}).catch((err) => eventLogger.warn({ err }, "Failed to write Slack log"));
-
-		// Add hourglass reaction
-		await addReaction(client, event.channel, event.ts, "hourglass_flowing_sand");
-
-		// Prepare message
-		const userMessage = await resolveUserMentions(event.text, prisma, client, workspace.id);
-		const onboarding = await isOnboardingNeeded(prisma, workspace);
-
-		let triggerType: "ONBOARDING" | "DM" | "MENTION" = "MENTION";
-		if (onboarding) triggerType = "ONBOARDING";
-		else if (event.type === "message" && event.channelType === "im") triggerType = "DM";
-
-		// Try to join channel on mentions
-		if (event.type === "app_mention") {
-			try {
-				await client.conversations.join({ channel: event.channel });
-			} catch (err) {
-				eventLogger.debug({ err, channel: event.channel }, "Could not join channel");
-			}
-		}
-
-		const [skillCatalog, integrationCatalog, activeThreads] = await Promise.all([
-			fetchSkillCatalog(workspace.id),
-			fetchIntegrationCatalog(workspace.id),
-			fetchActiveThreads(prisma, workspace.id),
-		]);
-
-		eventLogger.info(
-			{ channel: event.channel, user: event.user, type: event.type, onboarding },
-			"Event received",
-		);
-
-		// Usage enforcement (managed mode only)
-		if (usageLimiter) {
-			const budget = await usageLimiter.canRun(workspace.id);
-			if (!budget.allowed) {
-				await removeReaction(client, event.channel, event.ts, "hourglass_flowing_sand");
-				const resetDate = new Date(budget.resetsAt).toLocaleDateString("en-US", {
-					month: "long",
-					day: "numeric",
-				});
-				await safeReply(
-					say,
-					threadTs,
-					`Your workspace has reached its free tier usage limit ($${(budget.limitCents / 100).toFixed(0)}/month). Usage resets on ${resetDate}.`,
-				);
-				return;
-			}
-		}
-
-		try {
-			const result = await runner.run({
-				workspaceId: workspace.id,
-				memberId: member.id,
-				triggerType,
-				slackChannel: event.channel,
-				slackThreadTs: threadTs,
-				userMessage: onboarding ? buildOnboardingPrompt(userMessage) : userMessage,
-				promptContext: {
-					workspaceName: workspace.slackTeamName,
-					channel: event.channel,
-					slackThreadTs: threadTs,
-					userMessageTs: event.ts,
-					triggerType,
-					userName: member.displayName ?? undefined,
-					skillCatalog,
-					integrationCatalog,
-					activeThreads,
-					...(onboarding ? { onboardingPrompt: buildOnboardingPrompt(userMessage) } : {}),
-				},
-			});
-
-			// Record usage (fire-and-forget)
-			void usageTracker.record(workspace.id, {
-				inputTokens: result.inputTokens,
-				outputTokens: result.outputTokens,
-				costCents: result.costCents,
-				toolExecutions: 0,
-			});
-
-			if (onboarding) {
-				await markOnboardingComplete(prisma, workspace);
-				await seedChannelIntros(prisma, workspace.id, eventLogger);
-				await seedBuiltinSkills(prisma, workspace.id, eventLogger);
-			}
-
-			if (!result.messageSent) {
-				await sendResponse(say, result.responseText, threadTs);
-			}
-			await removeReaction(client, event.channel, event.ts, "hourglass_flowing_sand");
-		} catch (error) {
-			await removeReaction(client, event.channel, event.ts, "hourglass_flowing_sand");
-			if (error instanceof ThreadLockedError) {
-				await addReaction(client, event.channel, event.ts, "eyes");
-				runner.injectMessage(event.channel, threadTs, userMessage);
-				return;
-			}
-			if (error instanceof ConcurrencyExceededError) {
-				await safeReply(
-					say,
-					threadTs,
-					"I'm handling several requests right now. Please try again in a moment.",
-				);
-				return;
-			}
-			eventLogger.error({ err: error, event: event.type }, "Failed to handle event");
-			await safeReply(say, threadTs);
-		}
-	};
-
-	// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: interaction handler branching across multiple block action types and payloads
-	const onInteraction: InteractionHandler = async (interaction, connection) => {
-		if (interaction.type !== "block_actions") return;
-
-		const body = interaction.payload as Record<string, unknown>;
-		const actions = (body.actions ?? []) as Array<{ action_id?: string; value?: string }>;
-		const userId = ((body.user as Record<string, unknown>)?.id as string) ?? "unknown";
-		const client = connection.getClient();
-
-		for (const action of actions) {
-			const requestId = action.value;
-			if (!requestId) continue;
-
-			if (action.action_id === "permission_approve") {
-				const result = await prisma.permissionRequest.updateMany({
-					where: { id: requestId, status: "PENDING", expiresAt: { gt: new Date() } },
-					data: { status: "APPROVED", approvedBy: userId, resolvedAt: new Date() },
-				});
-				const request = await prisma.permissionRequest.findUnique({ where: { id: requestId } });
-				if (request?.slackChannel && request.slackMessageTs) {
-					const text =
-						result.count > 0
-							? `Approved by <@${userId}>. Executing \`${request.toolName}\`...`
-							: `Permission request already ${(request.status ?? "unknown").toLowerCase()}.`;
-					try {
-						await client.chat.update({
-							channel: request.slackChannel,
-							ts: request.slackMessageTs,
-							text,
-							blocks: [],
-						});
-					} catch (err) {
-						eventLogger.warn({ err }, "Failed to update permission message");
-					}
-				}
-			} else if (action.action_id === "permission_reject") {
-				const result = await prisma.permissionRequest.updateMany({
-					where: { id: requestId, status: "PENDING" },
-					data: { status: "REJECTED", approvedBy: userId, resolvedAt: new Date() },
-				});
-				const request = await prisma.permissionRequest.findUnique({ where: { id: requestId } });
-				if (request?.slackChannel && request.slackMessageTs) {
-					const text =
-						result.count > 0
-							? `Rejected by <@${userId}>.`
-							: `Permission request already ${(request.status ?? "unknown").toLowerCase()}.`;
-					try {
-						await client.chat.update({
-							channel: request.slackChannel,
-							ts: request.slackMessageTs,
-							text,
-							blocks: [],
-						});
-					} catch (err) {
-						eventLogger.warn({ err }, "Failed to update permission message");
-					}
-				}
-			}
-		}
-	};
-
-	// ─── ConnectionManager ──────────────────────────────
-
-	const connectionManager = new ConnectionManager({
-		config,
-		prisma,
-		logger: createLogger("connections"),
-		onEvent,
-		onInteraction,
-	});
-
-	// ─── Dynamic Slack tools (managed mode) ─────────────
-
-	if (isManaged(config) && !config.SLACK_BOT_TOKEN) {
-		registerDynamicSlackTools(registry, (workspaceId) => {
-			const conn = connectionManager.getConnection(workspaceId);
-			if (!conn) return null;
-			return (conn.getClient().token as string) ?? null;
-		});
-		runner.updateToolConfig({
-			client: gatewayClient,
-			tools: registry.getDefinitions(),
-		});
-		logger.info("Registered dynamic Slack tools for managed mode");
-	}
-
-	// ─── Dashboard API ──────────────────────────────────
 
 	let dashboardApi: { fetch: (req: Request) => Promise<Response> } | undefined;
 	if (config.ENABLE_DASHBOARD) {
 		dashboardApi = createDashboardApi({
 			config,
 			prisma,
-			connectionManager,
 			pdClient,
 			integrationWatcher,
 			disconnectApp: syncHandler?.disconnectApp.bind(syncHandler),
-			usageLimiter: usageLimiter ?? undefined,
+			usageLimiter,
 			logger: createLogger("dashboard-api"),
-		});
-		logger.info("Dashboard API enabled");
-	}
-
-	// ─── Gateway Server ─────────────────────────────────
-
-	let eventsApiHandler: ReturnType<typeof createEventsApiHandler> | undefined;
-	let oauthHandler: ReturnType<typeof createOAuthHandler> | undefined;
-
-	if (isManaged(config)) {
-		eventsApiHandler = createEventsApiHandler({
-			signingSecret: config.SLACK_SIGNING_SECRET,
-			connectionManager,
-			onEvent,
-			onInteraction,
-			logger: createLogger("events-api"),
-		});
-
-		async function runProactiveOnboarding(
-			workspaceId: string,
-			installerSlackUserId: string,
-		): Promise<void> {
-			const workspace = await prisma.workspace.findUnique({
-				where: { id: workspaceId },
-			});
-			if (!workspace) return;
-
-			// Skip if onboarding already completed (re-install)
-			const settings = workspace.settings as Record<string, unknown> | null;
-			if (settings?.onboardingCompletedAt) {
-				eventLogger.info({ workspaceId }, "Skipping proactive onboarding — already completed");
-				return;
-			}
-
-			const connection = connectionManager.getConnection(workspaceId);
-			if (!connection) {
-				eventLogger.warn({ workspaceId }, "No connection for proactive onboarding");
-				return;
-			}
-
-			// Open DM with installer
-			const dm = await connection.getClient().conversations.open({
-				users: installerSlackUserId,
-			});
-			const dmChannel = dm.channel?.id;
-			if (!dmChannel) {
-				eventLogger.warn({ workspaceId, installerSlackUserId }, "Failed to open DM for onboarding");
-				return;
-			}
-
-			// Mark onboarding complete immediately to prevent reactive onboarding race
-			await markOnboardingComplete(prisma, { id: workspace.id, settings: workspace.settings });
-
-			const member = await prisma.member.findFirst({
-				where: { workspaceId, slackUserId: installerSlackUserId },
-			});
-
-			const prompt = buildProactiveOnboardingPrompt(installerSlackUserId);
-			registerWorkspaceToken("local", workspaceId);
-
-			const result = await runner.run({
-				workspaceId,
-				memberId: member?.id ?? null,
-				triggerType: "ONBOARDING",
-				slackChannel: dmChannel,
-				slackThreadTs: `onboarding-${workspaceId}-${Date.now()}`,
-				userMessage: prompt,
-				promptContext: {
-					workspaceName: workspace.slackTeamName,
-					channel: dmChannel,
-					triggerType: "ONBOARDING",
-					onboardingPrompt: prompt,
-				},
-			});
-
-			void usageTracker.record(workspaceId, {
-				inputTokens: result.inputTokens,
-				outputTokens: result.outputTokens,
-				costCents: result.costCents,
-				toolExecutions: 0,
-			});
-
-			await seedChannelIntros(prisma, workspaceId, eventLogger);
-			await seedBuiltinSkills(prisma, workspaceId, eventLogger);
-			eventLogger.info({ workspaceId }, "Proactive onboarding completed");
-		}
-
-		oauthHandler = createOAuthHandler({
-			config,
-			prisma,
-			connectionManager,
-			logger: createLogger("oauth"),
-			onInstall: (workspaceId, installerSlackUserId) => {
-				void runProactiveOnboarding(workspaceId, installerSlackUserId).catch((err) =>
-					eventLogger.error({ err, workspaceId }, "Proactive onboarding failed"),
-				);
-			},
 		});
 	}
 
@@ -861,8 +487,7 @@ async function main(): Promise<void> {
 	};
 
 	const gatewayServer = Bun.serve({
-		port: gatewayPort,
-		// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: HTTP request router handling all gateway API routes and auth
+		port: config.TOOL_GATEWAY_PORT,
 		fetch: async (req: Request) => {
 			const url = new URL(req.url, "http://localhost");
 
@@ -870,23 +495,6 @@ async function main(): Promise<void> {
 				return new Response(null, { status: 204, headers: corsHeaders });
 			}
 
-			// Slack Events API (managed mode)
-			if (url.pathname === "/slack/events" && eventsApiHandler) {
-				return eventsApiHandler.handleEventsRequest(req);
-			}
-			if (url.pathname === "/slack/interactions" && eventsApiHandler) {
-				return eventsApiHandler.handleInteractionsRequest(req);
-			}
-
-			// Slack OAuth (managed mode)
-			if (url.pathname === "/slack/oauth/install" && oauthHandler) {
-				return oauthHandler.handleInstall(req);
-			}
-			if (url.pathname === "/slack/oauth/callback" && oauthHandler) {
-				return oauthHandler.handleCallback(req);
-			}
-
-			// Spaces callback API (deployed apps → Viktor)
 			if (url.pathname.startsWith("/api/viktor-spaces/") && spacesApi) {
 				const response = await spacesApi.fetch(req);
 				for (const [key, value] of Object.entries(corsHeaders)) {
@@ -895,7 +503,6 @@ async function main(): Promise<void> {
 				return response;
 			}
 
-			// Dashboard API
 			if (url.pathname.startsWith("/api/") && dashboardApi) {
 				const response = await dashboardApi.fetch(req);
 				for (const [key, value] of Object.entries(corsHeaders)) {
@@ -904,145 +511,164 @@ async function main(): Promise<void> {
 				return response;
 			}
 
-			// Tool gateway
 			return gateway.fetch(req);
 		},
 	});
+
+	const telegramApi = new TelegramApi(config.TELEGRAM_BOT_TOKEN, createLogger("telegram"));
+	const botProfile = await telegramApi.getMe();
+	const botUsername = config.TELEGRAM_BOT_USERNAME ?? botProfile.username;
+	const workspace = await resolveWorkspace(botProfile, config.TELEGRAM_BOT_TOKEN);
+	registerWorkspaceToken("local", workspace.id);
+
+	let stopRequested = false;
+	let nextOffset = 0;
+
+	const processTelegramMessage = async (message: TelegramMessage): Promise<void> => {
+		const text = message.text ?? message.caption ?? "";
+		if (!text || !message.from || message.from.is_bot) return;
+
+		const route = shouldHandleMessage(message, botProfile, botUsername);
+		if (!route.handle) return;
+
+		const chatId = String(message.chat.id);
+		const threadTs = route.threadTs;
+		const member = await resolveMember(workspace.id, message.from);
+		const rawText = normalizeIncomingText(message, botUsername);
+		const normalizedText = isTelegramSlashCommand(message, botUsername)
+			? normalizeSlashCommand(rawText, botUsername)
+			: rawText;
+
+		const [skillCatalog, integrationCatalog, activeThreads] = await Promise.all([
+			fetchSkillCatalog(workspace.id),
+			fetchIntegrationCatalog(workspace.id),
+			fetchActiveThreads(prisma, workspace.id),
+		]);
+		const onboardingNeeded = await isOnboardingNeeded(prisma, workspace);
+
+		try {
+			const budget = await usageLimiter.canRun(workspace.id);
+			if (!budget.allowed) {
+				const resetDate = new Date(budget.resetsAt).toLocaleDateString("en-US", {
+					month: "long",
+					day: "numeric",
+				});
+				await sendTelegramReply(
+					telegramApi,
+					chatId,
+					`This workspace has reached its usage limit. Usage resets on ${resetDate}.`,
+					String(message.message_id),
+				);
+				return;
+			}
+
+			const result = await runner.run({
+				workspaceId: workspace.id,
+				memberId: member.id,
+				triggerType: onboardingNeeded ? "ONBOARDING" : route.triggerType,
+				slackChannel: chatId,
+				slackThreadTs: threadTs,
+				userMessage: onboardingNeeded ? buildOnboardingPrompt(normalizedText) : normalizedText,
+				promptContext: {
+					workspaceName: workspace.slackTeamName,
+					channel: chatId,
+					slackThreadTs: threadTs,
+					userMessageTs: String(message.message_id),
+					triggerType: onboardingNeeded ? "ONBOARDING" : route.triggerType,
+					userName: member.displayName ?? undefined,
+					skillCatalog,
+					integrationCatalog,
+					activeThreads,
+					...(onboardingNeeded
+						? { onboardingPrompt: buildOnboardingPrompt(normalizedText) }
+						: {}),
+				},
+			});
+
+			if (onboardingNeeded) {
+				await markOnboardingComplete(prisma, workspace);
+				await seedChannelIntros(prisma, workspace.id, logger);
+				await seedBuiltinSkills(prisma, workspace.id, logger);
+			}
+
+			void usageTracker.record(workspace.id, {
+				inputTokens: result.inputTokens,
+				outputTokens: result.outputTokens,
+				costCents: result.costCents,
+				toolExecutions: 0,
+			});
+
+			if (!result.messageSent && result.responseText.trim()) {
+				await sendTelegramReply(telegramApi, chatId, result.responseText.trim(), threadTs);
+			}
+		} catch (error) {
+			if (error instanceof ThreadLockedError) {
+				runner.injectMessage(chatId, threadTs, normalizedText);
+				return;
+			}
+			if (error instanceof ConcurrencyExceededError) {
+				await sendTelegramReply(
+					telegramApi,
+					chatId,
+					"I am handling several requests right now. Please try again in a moment.",
+					String(message.message_id),
+				);
+				return;
+			}
+			logger.error({ err: error, chatId }, "Failed to handle Telegram message");
+			await sendTelegramReply(
+				telegramApi,
+				chatId,
+				"Something went wrong while processing your request. Please try again.",
+				String(message.message_id),
+			);
+		}
+	};
+
+	const poll = async (): Promise<void> => {
+		while (!stopRequested) {
+			try {
+				const updates = await telegramApi.getUpdates(nextOffset, 30);
+				for (const update of updates) {
+					nextOffset = update.update_id + 1;
+					const message = update.message;
+					if (!message) continue;
+					await processTelegramMessage(message);
+				}
+			} catch (error) {
+				logger.error({ err: error }, "Telegram polling failed");
+				await new Promise((resolve) => setTimeout(resolve, 3000));
+			}
+		}
+	};
+
+	const pollingPromise = poll();
+
+	const shutdown = async () => {
+		stopRequested = true;
+		logger.info("Shutting down");
+		integrationWatcher?.stop();
+		staleDetector.stop();
+		scheduler.stop();
+		await concurrencyLimiter.shutdown();
+		gatewayServer.stop();
+		await prisma.$disconnect();
+		await pollingPromise.catch(() => {});
+		process.exit(0);
+	};
+
+	process.on("SIGTERM", shutdown);
+	process.on("SIGINT", shutdown);
+
 	logger.info(
-		{ port: gatewayServer.port, tools: registry.getAllDefinitions().map((t) => t.name) },
-		"Tool gateway started",
-	);
-
-	// ─── Mode-specific startup ──────────────────────────
-
-	if (isSelfHosted(config)) {
-		// Self-hosted: use existing Bolt App for primary workspace, ConnectionManager for tracking
-		const app = createSlackApp(config);
-		app.use(createDeduplicator());
-		app.use(createBotFilter(logger));
-		registerEventHandlers(app, { prisma, runner, logger });
-		registerInteractionHandlers(app, { prisma, logger: createLogger("interactions") });
-		await startSlackApp(app);
-
-		// Resolve the primary workspace and register in ConnectionManager
-		const authResult = await app.client.auth.test();
-		const teamId = authResult.team_id as string;
-		const botUserId = authResult.user_id as string;
-		const botToken = config.SLACK_BOT_TOKEN as string;
-
-		const workspace = await resolveWorkspace(
-			prisma,
-			app.client as unknown as SlackClient,
-			teamId,
-			botToken,
-			botUserId,
-		);
-		registerWorkspaceToken("local", workspace.id);
-
-		// Register existing Bolt app in ConnectionManager for health checks and dashboard API
-		// (don't create a second SocketModeConnection)
-		connectionManager.registerExisting(workspace.id, teamId, {
+		{
+			port: gatewayServer.port,
 			workspaceId: workspace.id,
-			teamId,
-			botUserId,
-			start: async () => {},
-			stop: async () => {
-				await app.stop();
-			},
-			getClient: () => app.client,
-			isConnected: () => true,
-		});
-
-		// Approval gate for permissions
-		if (!config.DANGEROUSLY_SKIP_PERMISSIONS) {
-			const slackClient = app.client;
-			runner.updateApprovalGate({
-				slackPoster: {
-					postMessage: async (channel, threadTs, opts) => {
-						try {
-							const result = await slackClient.chat.postMessage({
-								channel,
-								thread_ts: threadTs,
-								text: opts.text,
-								blocks: opts.blocks as never[],
-							});
-							return result.ts ?? null;
-						} catch (err) {
-							logger.error({ err, channel }, "Failed to post permission message");
-							return null;
-						}
-					},
-				},
-				buildPermissionMessage,
-			});
-			logger.info("Approval gate enabled");
-		}
-
-		const shutdown = async () => {
-			logger.info("Shutting down");
-			integrationWatcher?.stop();
-			staleDetector.stop();
-			scheduler.stop();
-			await concurrencyLimiter.shutdown();
-			gatewayServer.stop();
-			await app.stop();
-			await connectionManager.disconnectAll();
-			await prisma.$disconnect();
-			process.exit(0);
-		};
-		process.on("SIGTERM", shutdown);
-		process.on("SIGINT", shutdown);
-
-		logger.info({ mode, teamId, workspaceId: workspace.id }, "OpenViktor started (self-hosted)");
-	} else {
-		// Managed: use Events API, workspaces connect via OAuth
-		await connectionManager.connectAll();
-
-		// Approval gate: post permission messages using workspace-specific client
-		if (!config.DANGEROUSLY_SKIP_PERMISSIONS) {
-			runner.updateApprovalGate({
-				slackPoster: {
-					postMessage: async (channel, threadTs, opts) => {
-						// Find the workspace for this channel by checking all connections
-						for (const conn of connectionManager.getAll()) {
-							try {
-								const result = await conn.getClient().chat.postMessage({
-									channel,
-									thread_ts: threadTs,
-									text: opts.text,
-									blocks: opts.blocks as never[],
-								});
-								return result.ts ?? null;
-							} catch {}
-						}
-						logger.error({ channel }, "No connection could post permission message");
-						return null;
-					},
-				},
-				buildPermissionMessage,
-			});
-			logger.info("Approval gate enabled (managed mode)");
-		}
-
-		const shutdown = async () => {
-			logger.info("Shutting down");
-			integrationWatcher?.stop();
-			staleDetector.stop();
-			scheduler.stop();
-			await concurrencyLimiter.shutdown();
-			gatewayServer.stop();
-			await connectionManager.disconnectAll();
-			await prisma.$disconnect();
-			process.exit(0);
-		};
-		process.on("SIGTERM", shutdown);
-		process.on("SIGINT", shutdown);
-
-		logger.info(
-			{ mode, workspaces: connectionManager.connectedCount },
-			"OpenViktor started (managed)",
-		);
-	}
+			telegramBotId: botProfile.id,
+			telegramBotUsername: botUsername ?? null,
+		},
+		"OpenViktor started (telegram self-hosted)",
+	);
 }
 
 main().catch((err) => {

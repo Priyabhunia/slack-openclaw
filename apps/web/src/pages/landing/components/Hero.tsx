@@ -821,7 +821,7 @@ export default function Hero() {
 						</h1>
 
 						<a
-							href="/slack/oauth/install"
+							href="/dashboard"
 							className="inline-flex items-center px-8 py-3.5 rounded-full text-sm font-medium hover:opacity-80 transition-opacity mb-3 md:mb-9"
 							style={{ background: "#111", color: "#fff" }}
 						>
